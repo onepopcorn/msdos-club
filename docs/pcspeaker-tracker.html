@@ -1647,7 +1647,14 @@ function parseMIDI(buf, filename) {
     evts.forEach(e => { if (e.tick > maxTick) maxTick = e.tick; });
   });
 
-  // Compute GCD of all note-on tick intervals → natural grid of this MIDI
+  // Compute the natural grid of this MIDI.
+  // A pure GCD of raw note-on intervals breaks on human-played (non-quantized)
+  // MIDI: tiny timing variations (e.g. 392 vs 386 ticks) make the GCD collapse
+  // to 1, which produces a useless, near-infinite grid with an unusably tiny
+  // LINE MS. Instead, use the median note-on interval as an estimate of the
+  // "typical" row length, then snap it to the nearest clean subdivision of a
+  // beat. This is far more robust to small expressive timing variations than
+  // an exact GCD, which only needs one outlier interval to break.
   const allOnTicks = [];
   tracks.forEach(evts => evts.forEach(e => { if (e.type==='noteOn') allOnTicks.push(e.tick); }));
   allOnTicks.sort((a,b)=>a-b);
@@ -1660,13 +1667,27 @@ function parseMIDI(buf, filename) {
       if (d > 0) diffs.push(d);
     }
     if (diffs.length) {
-      let g = diffs[0];
-      for (let i = 1; i < diffs.length; i++) {
-        let a = g, b = diffs[i];
-        while (b) { [a,b] = [b, a%b]; }
-        g = a;
+      const sorted = [...diffs].sort((a,b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      const median = sorted.length % 2 ? sorted[mid] : (sorted[mid-1] + sorted[mid]) / 2;
+
+      // Snap the median to the nearest standard subdivision of a beat
+      // (1/64 up to a whole beat), so the grid lines up with musical
+      // note values instead of an arbitrary tick count.
+      const subdivisions = [64, 32, 16, 8, 4, 2, 1];
+      let snapped = ticksPerBeat; // default: 1 beat
+      let bestDist = Infinity;
+      for (const sub of subdivisions) {
+        const unit = ticksPerBeat / sub;
+        const dist = Math.abs(median - unit);
+        if (dist < bestDist) { bestDist = dist; snapped = unit; }
       }
-      autoTicksPerRow = g;
+
+      // Never go finer than a 32nd note — anything smaller produces
+      // thousands of mostly-empty rows and a sub-millisecond LINE MS that
+      // can't actually be heard or scheduled reliably.
+      const minGrid = Math.max(1, Math.round(ticksPerBeat / 32));
+      autoTicksPerRow = Math.max(minGrid, Math.round(snapped));
     }
   }
 
@@ -1736,8 +1757,14 @@ function doMIDIImport() {
   // Convert each track to an array of tracker cells indexed by row
   // We take the note active at each row (the last note-on before or at that row's tick)
   const totalRows = Math.ceil(m.maxTick / ticksPerRow) + 1;
-  // Cap at a sane max to avoid hanging the browser
-  const cappedRows = Math.min(totalRows, 4096);
+  // Cap at a generous max to avoid hanging the browser on pathological files
+  // (e.g. an extremely fine grid). 65536 rows at a typical 100-300ms/line is
+  // hours of music, so this should never be hit by a real song.
+  const ROW_HARD_CAP = 65536;
+  const cappedRows = Math.min(totalRows, ROW_HARD_CAP);
+  if (totalRows > ROW_HARD_CAP) {
+    setStatus(`WARNING: MIDI TRUNCATED AT ${ROW_HARD_CAP} ROWS (needed ${totalRows}) — try a coarser TICKS/ROW`);
+  }
 
   // Build per-track row arrays
   // Strategy: place each note-on at its quantized row.
